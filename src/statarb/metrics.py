@@ -1,14 +1,15 @@
 """Performance metrics for backtest results.
 
-Computes Sharpe ratio, maximum drawdown, hit rate, and other
-standard statistics from a BacktestResult object.
+Computes annualised Sharpe ratio (net of costs), maximum drawdown,
+hit rate, CAGR, Calmar ratio, and trade-level statistics from a
+BacktestResult.
 
 Usage
 -----
-    from statarb.metrics import compute_metrics, MetricsResult
+    from statarb.metrics import compute_metrics, PerfMetrics
 
-    m = compute_metrics(result, trading_days=252)
-    print(f"Sharpe: {m.sharpe:.2f}, Max DD: {m.max_drawdown_pct:.1f}%")
+    m = compute_metrics(result, trading_days_per_year=252)
+    print(m.sharpe, m.max_drawdown_pct, m.hit_rate)
 """
 
 from __future__ import annotations
@@ -18,172 +19,253 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from statarb.backtest import BacktestResult, TradeRecord
+from statarb.backtest import BacktestResult
 
 
 @dataclass
-class MetricsResult:
-    """Aggregate performance statistics.
+class PerfMetrics:
+    """Aggregated performance metrics for a single backtest.
 
     Attributes
     ----------
     sharpe : float
-        Annualised Sharpe ratio on net daily P&L.  Risk-free rate assumed 0.
+        Annualised Sharpe ratio of net daily P&L.
     sortino : float
         Annualised Sortino ratio (downside deviation denominator).
-    max_drawdown : float
-        Maximum drawdown in dollars from peak equity.
     max_drawdown_pct : float
-        Maximum drawdown as a percentage of peak equity.
-    drawdown_series : pd.Series
-        Rolling drawdown in dollars throughout the backtest.
-    total_return : float
-        Total net P&L in dollars.
-    total_return_pct : float
-        Total net P&L as a percentage of initial notional.
+        Maximum peak-to-trough drawdown as a percentage of peak equity.
+    cagr : float
+        Compound annual growth rate as a fraction (e.g. 0.12 = 12 %).
+    calmar : float
+        CAGR / abs(max_drawdown_pct).  inf if drawdown is zero.
+    hit_rate : float
+        Fraction of completed trades with positive net P&L.
+    avg_win : float
+        Average net P&L of winning trades.
+    avg_loss : float
+        Average net P&L of losing trades (negative value).
+    profit_factor : float
+        Sum of wins / abs(sum of losses).  inf if no losses.
     n_trades : int
         Total number of completed round-trip trades.
-    hit_rate : float
-        Fraction of trades with positive net P&L.
-    avg_trade_pnl : float
-        Average net P&L per trade.
-    profit_factor : float
-        Gross profit / gross loss across all trades.
     costs_total : float
-        Total transaction costs paid.
-    annual_vol : float
-        Annualised daily P&L standard deviation.
+        Total transaction costs paid over the backtest in dollars.
+    avg_holding_days : float
+        Mean trade duration in calendar days.
     """
 
     sharpe: float
     sortino: float
-    max_drawdown: float
     max_drawdown_pct: float
-    drawdown_series: pd.Series
-    total_return: float
-    total_return_pct: float
-    n_trades: int
+    cagr: float
+    calmar: float
     hit_rate: float
-    avg_trade_pnl: float
+    avg_win: float
+    avg_loss: float
     profit_factor: float
+    n_trades: int
     costs_total: float
-    annual_vol: float
+    avg_holding_days: float
 
 
-def _drawdown_series(equity: pd.Series) -> pd.Series:
-    """Compute rolling dollar drawdown from peak equity."""
-    peak = equity.cummax()
-    return equity - peak
+def _annualised_sharpe(daily_pnl: pd.Series, ann_factor: float = 252.0) -> float:
+    """Annualised Sharpe ratio from a daily P&L series.
+
+    Uses the standard sqrt(T) scaling.  Returns 0.0 if std is zero.
+
+    Parameters
+    ----------
+    daily_pnl : pd.Series
+        Daily net P&L in dollars.
+    ann_factor : float
+        Trading days per year for annualisation.
+
+    Returns
+    -------
+    float
+        Annualised Sharpe ratio.
+    """
+    if daily_pnl.std(ddof=1) == 0:
+        return 0.0
+    return float(daily_pnl.mean() / daily_pnl.std(ddof=1) * np.sqrt(ann_factor))
 
 
-def _hit_rate(trades: list[TradeRecord]) -> float:
-    """Fraction of trades with net P&L > 0."""
-    if not trades:
-        return float("nan")
-    wins = sum(1 for t in trades if t.pnl_net > 0)
-    return wins / len(trades)
+def _annualised_sortino(daily_pnl: pd.Series, ann_factor: float = 252.0) -> float:
+    """Annualised Sortino ratio from a daily P&L series.
+
+    Uses downside deviation (negative returns only) in the denominator.
+    Returns 0.0 if downside deviation is zero.
+
+    Parameters
+    ----------
+    daily_pnl : pd.Series
+        Daily net P&L in dollars.
+    ann_factor : float
+        Trading days per year.
+
+    Returns
+    -------
+    float
+        Annualised Sortino ratio.
+    """
+    downside = daily_pnl[daily_pnl < 0]
+    if len(downside) == 0 or downside.std(ddof=1) == 0:
+        return 0.0
+    return float(daily_pnl.mean() / downside.std(ddof=1) * np.sqrt(ann_factor))
 
 
-def _profit_factor(trades: list[TradeRecord]) -> float:
-    """Ratio of total gross profit to total gross loss."""
-    gross_profit = sum(t.pnl_net for t in trades if t.pnl_net > 0)
-    gross_loss = sum(-t.pnl_net for t in trades if t.pnl_net < 0)
-    if gross_loss == 0:
-        return float("inf")
-    return gross_profit / gross_loss
+def max_drawdown(equity: pd.Series) -> float:
+    """Maximum peak-to-trough drawdown as a percentage.
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Cumulative P&L series (dollars).  Can start at any level.
+
+    Returns
+    -------
+    float
+        Maximum drawdown in percent (e.g. -15.3).  Zero or negative.
+    """
+    roll_max = equity.cummax()
+    drawdown = equity - roll_max
+    if roll_max.max() <= 0:
+        return 0.0
+    return float((drawdown / roll_max.abs().replace(0, np.nan)).min() * 100)
+
+
+def _cagr(equity: pd.Series, ann_factor: float = 252.0) -> float:
+    """Compound annual growth rate from a cumulative P&L series.
+
+    Defined as (final_equity / initial_notional)^(1/years) - 1, where
+    initial_notional defaults to 1 if the series starts at or below 0.
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Cumulative dollar P&L.
+    ann_factor : float
+        Trading days per year.
+
+    Returns
+    -------
+    float
+        CAGR as a fraction.  Returns 0.0 if the series is too short.
+    """
+    n = len(equity)
+    if n < 2:
+        return 0.0
+    years = n / ann_factor
+    final = equity.iloc[-1]
+    # For dollar P&L: growth relative to a reference base of 1 notional unit
+    # We use absolute equity; if negative overall, CAGR is negative.
+    base = max(abs(equity.iloc[0]) + 1e-9, 1.0)
+    total_return = final / base
+    if total_return <= 0:
+        return float(-((abs(total_return)) ** (1.0 / years) - 1))
+    return float(total_return ** (1.0 / years) - 1)
 
 
 def compute_metrics(
     result: BacktestResult,
-    notional: float = 100_000.0,
-    trading_days: int = 252,
-) -> MetricsResult:
-    """Compute performance metrics from a BacktestResult.
+    ann_factor: float = 252.0,
+) -> PerfMetrics:
+    """Compute all performance metrics for a BacktestResult.
 
     Parameters
     ----------
     result : BacktestResult
-        Output of run_backtest().
-    notional : float
-        Initial dollar notional (for percentage return calculation).
-    trading_days : int
-        Number of trading days per year (default 252).
+        Output from statarb.backtest.run_backtest().
+    ann_factor : float
+        Trading days per year (default 252).
 
     Returns
     -------
-    MetricsResult
+    PerfMetrics
+        Populated metrics dataclass.
     """
     pnl = result.daily_pnl
-    eq = result.equity
-
-    # Annualised Sharpe (risk-free rate = 0)
-    mean_daily = pnl.mean()
-    std_daily = pnl.std(ddof=1)
-    sharpe = (mean_daily / std_daily * np.sqrt(trading_days)) if std_daily > 0 else 0.0
-
-    # Sortino
-    downside = pnl[pnl < 0]
-    downside_std = downside.std(ddof=1) if len(downside) > 1 else std_daily
-    sortino = (mean_daily / downside_std * np.sqrt(trading_days)) if downside_std > 0 else 0.0
-
-    # Drawdown
-    dd_series = _drawdown_series(eq)
-    max_dd = dd_series.min()  # most negative value
-    peak_at_max_dd = eq.cummax().loc[dd_series.idxmin()] if len(dd_series) > 0 else notional
-    max_dd_pct = (max_dd / peak_at_max_dd * 100.0) if peak_at_max_dd != 0 else 0.0
-
-    # Returns
-    total_return = eq.iloc[-1] if len(eq) > 0 else 0.0
-    total_return_pct = total_return / notional * 100.0
-
-    # Trade stats
+    equity = result.equity
     trades = result.trades
+
+    sharpe = _annualised_sharpe(pnl, ann_factor)
+    sortino = _annualised_sortino(pnl, ann_factor)
+    mdd = max_drawdown(equity)
+    cagr = _cagr(equity, ann_factor)
+    calmar = cagr / abs(mdd / 100) if mdd != 0 else float("inf")
+
+    # Trade-level stats
     n_trades = len(trades)
-    hit_rate = _hit_rate(trades)
-    avg_pnl = np.mean([t.pnl_net for t in trades]) if trades else 0.0
-    pf = _profit_factor(trades)
+    if n_trades > 0:
+        net_pnls = [t.pnl_net for t in trades]
+        wins = [p for p in net_pnls if p > 0]
+        losses = [p for p in net_pnls if p <= 0]
+        hit_rate = len(wins) / n_trades
+        avg_win = float(np.mean(wins)) if wins else 0.0
+        avg_loss = float(np.mean(losses)) if losses else 0.0
+        sum_wins = sum(wins)
+        sum_losses = abs(sum(losses))
+        profit_factor = sum_wins / sum_losses if sum_losses > 0 else float("inf")
 
-    annual_vol = std_daily * np.sqrt(trading_days)
+        durations = [
+            (t.exit_date - t.entry_date).days for t in trades
+            if hasattr(t.exit_date, "days") is False  # pd.Timestamp subtraction
+        ]
+        # Recalculate properly for pd.Timestamp
+        durations = []
+        for t in trades:
+            try:
+                d = (t.exit_date - t.entry_date).days
+                durations.append(d)
+            except Exception:
+                durations.append(0)
+        avg_holding = float(np.mean(durations)) if durations else 0.0
+    else:
+        hit_rate = 0.0
+        avg_win = 0.0
+        avg_loss = 0.0
+        profit_factor = 0.0
+        avg_holding = 0.0
 
-    return MetricsResult(
+    return PerfMetrics(
         sharpe=sharpe,
         sortino=sortino,
-        max_drawdown=max_dd,
-        max_drawdown_pct=max_dd_pct,
-        drawdown_series=dd_series,
-        total_return=total_return,
-        total_return_pct=total_return_pct,
-        n_trades=n_trades,
+        max_drawdown_pct=mdd,
+        cagr=cagr,
+        calmar=calmar,
         hit_rate=hit_rate,
-        avg_trade_pnl=avg_pnl,
-        profit_factor=pf,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        profit_factor=profit_factor,
+        n_trades=n_trades,
         costs_total=result.costs_total,
-        annual_vol=annual_vol,
+        avg_holding_days=avg_holding,
     )
 
 
-def print_metrics(m: MetricsResult, label: str = "") -> None:
-    """Print a formatted metrics summary to stdout.
+def metrics_to_dict(m: PerfMetrics) -> dict:
+    """Serialise PerfMetrics to a plain dict with formatted values.
 
     Parameters
     ----------
-    m : MetricsResult
-        Metrics to display.
-    label : str
-        Optional label (e.g. pair ticker) printed as header.
-    """
-    if label:
-        print(f"\n{'='*50}")
-        print(f"  {label}")
-        print(f"{'='*50}")
+    m : PerfMetrics
 
-    print(f"  Sharpe (annualised, after costs): {m.sharpe:>8.3f}")
-    print(f"  Sortino:                          {m.sortino:>8.3f}")
-    print(f"  Max drawdown:                     {m.max_drawdown:>10.2f}  ({m.max_drawdown_pct:.1f}%)")
-    print(f"  Total return:                     {m.total_return:>10.2f}  ({m.total_return_pct:.1f}%)")
-    print(f"  Annual vol:                       {m.annual_vol:>10.2f}")
-    print(f"  Trades:                           {m.n_trades:>8d}")
-    print(f"  Hit rate:                         {m.hit_rate:>8.1%}")
-    print(f"  Avg trade P&L:                    {m.avg_trade_pnl:>10.2f}")
-    print(f"  Profit factor:                    {m.profit_factor:>8.3f}")
-    print(f"  Total costs:                      {m.costs_total:>10.2f}")
+    Returns
+    -------
+    dict
+        Human-readable string values for display.
+    """
+    return {
+        "Sharpe (net)": f"{m.sharpe:.3f}",
+        "Sortino": f"{m.sortino:.3f}",
+        "Max drawdown": f"{m.max_drawdown_pct:.2f}%",
+        "CAGR": f"{m.cagr:.2%}",
+        "Calmar": f"{m.calmar:.2f}" if m.calmar != float("inf") else "inf",
+        "Hit rate": f"{m.hit_rate:.1%}",
+        "Avg win ($)": f"{m.avg_win:,.0f}",
+        "Avg loss ($)": f"{m.avg_loss:,.0f}",
+        "Profit factor": f"{m.profit_factor:.2f}" if m.profit_factor != float("inf") else "inf",
+        "Trades": str(m.n_trades),
+        "Total costs ($)": f"{m.costs_total:,.0f}",
+        "Avg holding (days)": f"{m.avg_holding_days:.1f}",
+    }
