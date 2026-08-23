@@ -248,6 +248,16 @@ def plot_pair_selection_table(
     # Truncate to max 15 rows for readability
     display = display.head(15)
 
+    if display.empty:
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No pairs selected.", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12)
+        plt.tight_layout()
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return os.path.abspath(out_path)
+
     n_rows, n_cols = display.shape
     fig_h = max(2.0, 0.45 * (n_rows + 2))
     fig, ax = plt.subplots(figsize=(max(10, n_cols * 1.4), fig_h))

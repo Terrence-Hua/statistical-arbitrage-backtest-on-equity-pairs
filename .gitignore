@@ -11,5 +11,6 @@ venv/
 reports/*.png
 reports/*.csv
 !reports/.gitkeep
+!reports/*_example.png
 data/*.csv
 !data/.gitkeep
