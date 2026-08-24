@@ -1,292 +1,213 @@
-"""Equity curve and drawdown chart generation.
+"""Chart generation for backtest reports.
 
-Produces two-panel figures showing the cumulative P&L equity curve and
-the corresponding underwater drawdown series.  Figures are saved as PNG
-files in the specified output directory.
+Produces equity curve, drawdown, z-score signal, and spread charts
+and saves them to the reports/ directory.
 
 Usage
 -----
-    from statarb.charts import plot_equity_drawdown, plot_zscore_signals
+    from statarb.charts import plot_equity_curve, plot_zscore_signals
 
-    path = plot_equity_drawdown(result, pair_label="S05/S09", out_dir="reports")
-    path2 = plot_zscore_signals(z_score, positions, pair_label="S05/S09", out_dir="reports")
+    plot_equity_curve(result, metrics, pair_label="S23/S24",
+                      out_path="reports/equity_S23_S24.png")
+    plot_zscore_signals(z_score, result, pair_label="S23/S24",
+                        entry_z=2.0, stop_z=3.5,
+                        out_path="reports/zscore_S23_S24.png")
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for server/CI use
-
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
+import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 
-from statarb.backtest import BacktestResult
+matplotlib.use("Agg")  # non-interactive backend
+
+_BLUE = "#1a73e8"
+_RED = "#ea4335"
+_GREEN = "#34a853"
+_GREY = "#5f6368"
+_LIGHT_GREY = "#dadce0"
 
 
-def _drawdown_series(equity: pd.Series) -> pd.Series:
-    """Compute percentage drawdown from peak at each point.
+def _save(fig: plt.Figure, out_path: str) -> None:
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_equity_curve(
+    equity: pd.Series,
+    drawdown: pd.Series,
+    pair_label: str = "",
+    out_path: str = "reports/equity.png",
+    sharpe: float | None = None,
+    max_dd_pct: float | None = None,
+) -> None:
+    """Plot equity curve and drawdown on a two-panel figure.
 
     Parameters
     ----------
     equity : pd.Series
-        Cumulative P&L series.
-
-    Returns
-    -------
-    pd.Series
-        Drawdown in percent (0 to -100).
-    """
-    roll_max = equity.cummax()
-    # Guard against division by zero when equity starts at 0
-    base = roll_max.abs().clip(lower=1e-9)
-    dd = (equity - roll_max) / base * 100
-    return dd
-
-
-def plot_equity_drawdown(
-    result: BacktestResult,
-    pair_label: str = "",
-    out_dir: str = "reports",
-    filename: str | None = None,
-    notional: float = 100_000.0,
-) -> str:
-    """Plot equity curve and drawdown in a two-panel figure.
-
-    Parameters
-    ----------
-    result : BacktestResult
-        Output from statarb.backtest.run_backtest().
+        Cumulative net P&L series.
+    drawdown : pd.Series
+        Rolling drawdown series (negative values).
     pair_label : str
-        Pair identifier shown in the chart title (e.g. "S05/S09").
-    out_dir : str
-        Directory where the PNG is saved.  Created if missing.
-    filename : str or None
-        Output filename.  Defaults to ``equity_{pair_label}.png``.
-    notional : float
-        Reference notional for the title annotation.
-
-    Returns
-    -------
-    str
-        Absolute path to the saved PNG file.
+        Chart title suffix.
+    out_path : str
+        File path for the output PNG.
+    sharpe : float or None
+        Sharpe ratio annotation.
+    max_dd_pct : float or None
+        Max drawdown % annotation.
     """
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    fig, (ax_eq, ax_dd) = plt.subplots(
+        2, 1, figsize=(10, 6), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    fig.patch.set_facecolor("white")
 
-    equity = result.equity
-    dd = _drawdown_series(equity)
+    # Equity curve
+    ax_eq.plot(equity.index, equity.values, color=_BLUE, linewidth=1.4, label="Net equity")
+    ax_eq.axhline(0, color=_GREY, linewidth=0.6, linestyle="--")
+    ax_eq.fill_between(equity.index, 0, equity.values,
+                       where=(equity.values >= 0), alpha=0.08, color=_GREEN)
+    ax_eq.fill_between(equity.index, 0, equity.values,
+                       where=(equity.values < 0), alpha=0.08, color=_RED)
+    ax_eq.set_ylabel("Cumulative P&L ($)", fontsize=9)
+    ax_eq.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda x, _: f"${x:,.0f}")
+    )
 
-    label_safe = pair_label.replace("/", "_")
-    if filename is None:
-        filename = f"equity_{label_safe}.png" if label_safe else "equity_curve.png"
-    out_path = os.path.join(out_dir, filename)
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
-                                   gridspec_kw={"height_ratios": [3, 1]})
-    fig.patch.set_facecolor("#f8f9fa")
-
-    # — Equity curve —
-    ax1.plot(equity.index, equity.values, color="#1f77b4", linewidth=1.5)
-    ax1.axhline(0, color="#888888", linewidth=0.8, linestyle="--")
-    ax1.fill_between(equity.index, equity.values, 0,
-                     where=(equity.values >= 0), alpha=0.15, color="#1f77b4")
-    ax1.fill_between(equity.index, equity.values, 0,
-                     where=(equity.values < 0), alpha=0.15, color="#d62728")
-    ax1.set_ylabel("Cumulative P&L ($)", fontsize=11)
-    ax1.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, _: f"${x:,.0f}"))
     title = f"Equity curve — {pair_label}" if pair_label else "Equity curve"
-    ax1.set_title(title, fontsize=13, fontweight="bold")
-    ax1.grid(True, alpha=0.3)
-    ax1.set_facecolor("#f8f9fa")
+    annot = []
+    if sharpe is not None:
+        annot.append(f"Sharpe {sharpe:.2f}")
+    if max_dd_pct is not None:
+        annot.append(f"Max DD {max_dd_pct:.1f}%")
+    if annot:
+        title += f"  |  {', '.join(annot)}"
+    ax_eq.set_title(title, fontsize=10)
+    ax_eq.grid(axis="y", color=_LIGHT_GREY, linewidth=0.5)
 
-    # Annotate final P&L
-    final_pnl = equity.iloc[-1]
-    ax1.annotate(
-        f"Final: ${final_pnl:,.0f}",
-        xy=(equity.index[-1], final_pnl),
-        xytext=(-80, 15 if final_pnl >= 0 else -25),
-        textcoords="offset points",
-        fontsize=9,
-        color="#1f77b4" if final_pnl >= 0 else "#d62728",
+    # Drawdown
+    ax_dd.fill_between(drawdown.index, 0, drawdown.values, color=_RED, alpha=0.6)
+    ax_dd.set_ylabel("Drawdown ($)", fontsize=9)
+    ax_dd.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda x, _: f"${x:,.0f}")
     )
+    ax_dd.grid(axis="y", color=_LIGHT_GREY, linewidth=0.5)
+    ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax_dd.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+    plt.setp(ax_dd.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
 
-    # — Drawdown —
-    ax2.fill_between(dd.index, dd.values, 0, color="#d62728", alpha=0.6)
-    ax2.plot(dd.index, dd.values, color="#d62728", linewidth=0.8)
-    ax2.set_ylabel("Drawdown (%)", fontsize=11)
-    ax2.yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, _: f"{x:.1f}%"))
-    ax2.set_xlabel("Date", fontsize=11)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_facecolor("#f8f9fa")
-
-    max_dd = dd.min()
-    ax2.axhline(max_dd, color="#888888", linewidth=0.8, linestyle=":")
-    ax2.annotate(
-        f"Max DD: {max_dd:.1f}%",
-        xy=(dd.idxmin(), max_dd),
-        xytext=(10, -15),
-        textcoords="offset points",
-        fontsize=8,
-        color="#555555",
-    )
-
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return os.path.abspath(out_path)
+    fig.tight_layout(pad=1.2)
+    _save(fig, out_path)
 
 
 def plot_zscore_signals(
     z_score: pd.Series,
     positions: pd.Series,
     pair_label: str = "",
-    out_dir: str = "reports",
     entry_z: float = 2.0,
     exit_z: float = 0.5,
-    filename: str | None = None,
-) -> str:
-    """Plot z-score with entry/exit thresholds and position shading.
+    stop_z: float = 3.5,
+    out_path: str = "reports/zscore.png",
+) -> None:
+    """Plot z-score time series with signal thresholds and position shading.
 
     Parameters
     ----------
     z_score : pd.Series
-        Spread z-score time series.
+        Spread z-score series.
     positions : pd.Series
-        Position direction (+1, 0, -1) on the same index.
+        Position direction series (+1, -1, 0).
     pair_label : str
-        Pair identifier for the title.
-    out_dir : str
-        Output directory.
+        Chart title suffix.
     entry_z : float
-        Entry z-score threshold lines drawn at ±entry_z.
+        Entry z-score threshold.
     exit_z : float
-        Exit z-score threshold lines drawn at ±exit_z.
-    filename : str or None
-        Output filename.  Defaults to ``zscore_{pair_label}.png``.
-
-    Returns
-    -------
-    str
-        Absolute path to the saved PNG file.
+        Exit z-score threshold.
+    stop_z : float
+        Stop-loss z-score threshold.
+    out_path : str
+        File path for the output PNG.
     """
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    label_safe = pair_label.replace("/", "_")
-    if filename is None:
-        filename = f"zscore_{label_safe}.png" if label_safe else "zscore.png"
-    out_path = os.path.join(out_dir, filename)
-
     fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor("#f8f9fa")
-    ax.set_facecolor("#f8f9fa")
+    fig.patch.set_facecolor("white")
 
-    # Shade long/short regions
-    long_mask = positions > 0
-    short_mask = positions < 0
-    ax.fill_between(z_score.index, z_score, where=long_mask,
-                    alpha=0.25, color="#2ca02c", label="Long spread")
-    ax.fill_between(z_score.index, z_score, where=short_mask,
-                    alpha=0.25, color="#d62728", label="Short spread")
+    ax.plot(z_score.index, z_score.values, color=_BLUE, linewidth=0.9, label="Z-score")
+    ax.axhline(0, color=_GREY, linewidth=0.6)
 
-    ax.plot(z_score.index, z_score.values, color="#1f77b4", linewidth=1.0)
-
-    # Threshold lines
-    for level, style, color in [
-        (entry_z, "--", "#d62728"),
-        (-entry_z, "--", "#2ca02c"),
-        (exit_z, ":", "#888888"),
-        (-exit_z, ":", "#888888"),
-        (0, "-", "#333333"),
+    for val, ls, label in [
+        (entry_z, "--", f"±{entry_z} entry"),
+        (-entry_z, "--", None),
+        (exit_z, ":", f"±{exit_z} exit"),
+        (-exit_z, ":", None),
+        (stop_z, "-.", f"±{stop_z} stop"),
+        (-stop_z, "-.", None),
     ]:
-        ax.axhline(level, linestyle=style, color=color, linewidth=0.9, alpha=0.8)
+        ax.axhline(val, color=_GREY, linewidth=0.7, linestyle=ls,
+                   label=label if label else "_nolegend_")
 
-    title = f"Spread z-score — {pair_label}" if pair_label else "Spread z-score"
-    ax.set_title(title, fontsize=13, fontweight="bold")
-    ax.set_ylabel("Z-score", fontsize=11)
-    ax.set_xlabel("Date", fontsize=11)
-    ax.legend(loc="upper right", fontsize=9)
-    ax.grid(True, alpha=0.3)
+    # shade position periods
+    common = z_score.index.intersection(positions.index)
+    pos = positions.loc[common]
+    z_common = z_score.loc[common]
 
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return os.path.abspath(out_path)
+    long_mask = pos == 1
+    short_mask = pos == -1
+    ax.fill_between(common, z_common.values, where=long_mask.values,
+                    alpha=0.15, color=_GREEN, label="Long spread")
+    ax.fill_between(common, z_common.values, where=short_mask.values,
+                    alpha=0.15, color=_RED, label="Short spread")
+
+    title = f"Z-score signals — {pair_label}" if pair_label else "Z-score signals"
+    ax.set_title(title, fontsize=10)
+    ax.set_ylabel("Z-score", fontsize=9)
+    ax.legend(fontsize=8, ncol=4, loc="upper right")
+    ax.grid(axis="y", color=_LIGHT_GREY, linewidth=0.5)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
+
+    fig.tight_layout(pad=1.2)
+    _save(fig, out_path)
 
 
-def plot_pair_selection_table(
-    stats_df: pd.DataFrame,
-    out_dir: str = "reports",
-    filename: str = "pair_selection.png",
-) -> str:
-    """Render the pair selection statistics table as a PNG.
+def plot_spread(
+    spread: pd.Series,
+    pair_label: str = "",
+    out_path: str = "reports/spread.png",
+) -> None:
+    """Plot the raw spread (log price difference) over time.
 
     Parameters
     ----------
-    stats_df : pd.DataFrame
-        Output of statarb.stats.pair_stats_table().
-    out_dir : str
-        Output directory.
-    filename : str
-        Output filename.
-
-    Returns
-    -------
-    str
-        Absolute path to the saved PNG file.
+    spread : pd.Series
+        Spread series (log_a - beta * log_b).
+    pair_label : str
+        Chart title suffix.
+    out_path : str
+        File path for the output PNG.
     """
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    out_path = os.path.join(out_dir, filename)
+    fig, ax = plt.subplots(figsize=(10, 3))
+    fig.patch.set_facecolor("white")
 
-    display = stats_df.copy()
-    for col in display.select_dtypes(include=bool).columns:
-        display[col] = display[col].map({True: "yes", False: "no"})
+    ax.plot(spread.index, spread.values, color=_BLUE, linewidth=0.9)
+    roll_mean = spread.rolling(60).mean()
+    ax.plot(roll_mean.index, roll_mean.values, color=_RED, linewidth=1.1,
+            linestyle="--", label="60d rolling mean")
+    ax.set_title(f"Spread — {pair_label}" if pair_label else "Spread", fontsize=10)
+    ax.set_ylabel("log(A) - β·log(B)", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", color=_LIGHT_GREY, linewidth=0.5)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
 
-    # Truncate to max 15 rows for readability
-    display = display.head(15)
-
-    if display.empty:
-        fig, ax = plt.subplots(figsize=(6, 2))
-        ax.axis("off")
-        ax.text(0.5, 0.5, "No pairs selected.", ha="center", va="center",
-                transform=ax.transAxes, fontsize=12)
-        plt.tight_layout()
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return os.path.abspath(out_path)
-
-    n_rows, n_cols = display.shape
-    fig_h = max(2.0, 0.45 * (n_rows + 2))
-    fig, ax = plt.subplots(figsize=(max(10, n_cols * 1.4), fig_h))
-    ax.axis("off")
-
-    table = ax.table(
-        cellText=display.values,
-        colLabels=display.columns.tolist(),
-        cellLoc="center",
-        loc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(8)
-    table.auto_set_column_width(col=list(range(n_cols)))
-
-    # Header styling
-    for j in range(n_cols):
-        table[0, j].set_facecolor("#2c3e50")
-        table[0, j].set_text_props(color="white", fontweight="bold")
-
-    # Alternating row colors
-    for i in range(1, n_rows + 1):
-        color = "#f0f4f8" if i % 2 == 0 else "white"
-        for j in range(n_cols):
-            table[i, j].set_facecolor(color)
-
-    ax.set_title("Pair selection — cointegration statistics", fontsize=12,
-                 fontweight="bold", pad=10)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return os.path.abspath(out_path)
+    fig.tight_layout(pad=1.2)
+    _save(fig, out_path)
